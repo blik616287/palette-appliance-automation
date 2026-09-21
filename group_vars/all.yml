@@ -1,0 +1,81 @@
+---
+# ============================================================================
+# Palette management appliance - end-to-end build + deploy
+#
+#   1. put the Artifact Studio downloads in artifacts/  (see artifacts/README.md)
+#   2. ansible-playbook site.yml
+# ============================================================================
+
+# --- Inputs -----------------------------------------------------------------
+# Left empty, each is auto-discovered in artifacts/ by extension. Set an
+# explicit path to pin a specific file.
+artifacts_dir: "{{ playbook_dir }}/artifacts"
+content_bundle: ""            # artifacts/*.tar.zst        (required)
+content_bundle_signature: ""  # artifacts/*.tar.sig.bin    ("" = upload unsigned)
+signing_public_key: ""        # artifacts/*.pem            ("" = no verification)
+
+# --- CanvOS build -----------------------------------------------------------
+# The pinned submodule. The playbook patches its Dockerfile in place and never
+# commits to it.
+canvos_dir: "{{ playbook_dir }}/CanvOS"
+# Must match the stylus/agent version the content bundle ships.
+pe_version: v4.10.4
+os_distribution: ubuntu
+os_version: "22.04"
+arch: amd64
+# The appliance replaces this with the bundle's provider image at cluster
+# creation, so these only affect the installer image itself.
+k8s_distribution: k3s
+k8s_version: 1.36.2
+iso_name: palette-edge-installer
+image_registry: ttl.sh
+custom_tag: appliance
+# Host tooling for the Piraeus/LINSTOR storage stack.
+install_storage_tooling: true
+force_rebuild: false
+fips_enabled: false
+
+# --- Appliance login (seeded during install; no console interaction) --------
+appliance_admin_user: paletteadmin
+# Leave empty to generate one per run; it is printed in the final summary.
+# Override with: -e appliance_admin_password=...
+appliance_admin_password: ""
+# Group granting appliance administrative access.
+appliance_admin_group: admin
+
+# --- Libvirt / VM -----------------------------------------------------------
+libvirt_uri: qemu:///system
+vm_name: palette-appliance
+vm_network: default
+vm_vcpus: 8
+vm_memory_mb: 16384
+# Docs: install disk 300 GB min (500 recommended), storage pool disk >= 500 GB.
+vm_os_disk_gb: 500
+vm_data_disk_gb: 500
+libvirt_pool: default
+libvirt_iso_pool: iso
+# Non-Secure-Boot OVMF; the appliance ISO is UEFI-only.
+ovmf_code: /usr/share/OVMF/OVMF_CODE_4M.fd
+ovmf_vars: /usr/share/OVMF/OVMF_VARS_4M.fd
+vm_recreate: true
+
+# --- Cluster ----------------------------------------------------------------
+cluster_name: palette-mgmt
+# Must be free and outside the DHCP pool; reserved in the libvirt network when
+# reserve_vip is true.
+cluster_vip: 192.168.122.250
+reserve_vip: true
+vip_reservation_mac: "52:54:00:de:ad:fa"
+control_plane_count: 1
+# Single node needs these at 1; three-node HA uses the profile defaults (3).
+csi_placement_count: 1
+mongo_replicas: 1
+storage_pool_drive: /dev/sdb
+# Internal Zot registry admin password; generated per run when empty.
+registry_password: ""
+
+# --- Timeouts (seconds) -----------------------------------------------------
+iso_build_timeout: 3600
+install_timeout: 3600
+localui_timeout: 1200
+cluster_timeout: 3600

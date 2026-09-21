@@ -1,0 +1,147 @@
+---
+# Build the appliance installer ISO with CanvOS.
+
+- name: Check required inputs exist
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: input_files
+  failed_when: not input_files.stat.exists
+  loop: "{{ [content_bundle] + ([signing_public_key] if signing_public_key else []) }}"
+
+- name: Check CanvOS checkout and earthly wrapper are present
+  ansible.builtin.stat:
+    path: "{{ canvos_dir }}/earthly.sh"
+  register: earthly_sh
+  failed_when: not earthly_sh.stat.exists
+
+- name: Render .arg
+  ansible.builtin.template:
+    src: arg.j2
+    dest: "{{ canvos_dir }}/.arg"
+    mode: "0644"
+  register: arg_file
+
+- name: Hash the appliance admin password
+  # openssl rather than the password_hash filter, which needs passlib.
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - passwd
+      - -6
+      - -salt
+      - "{{ (appliance_admin_user ~ 'canvos') | hash('md5') | truncate(16, true, '') }}"
+      - "{{ appliance_admin_password }}"
+  register: admin_pw
+  changed_when: false
+  # Computes a value only; must run in --check too or the fact below is unset.
+  check_mode: false
+  no_log: true
+
+- name: Store the password hash
+  ansible.builtin.set_fact:
+    admin_password_hash: "{{ admin_pw.stdout | trim }}"
+  no_log: true
+
+- name: Render user-data (seeds the Local UI admin account)
+  ansible.builtin.template:
+    src: user-data.j2
+    dest: "{{ canvos_dir }}/user-data"
+    mode: "0644"
+  register: user_data_file
+
+- name: Embed the content-signing public key
+  when: signing_public_key | length > 0
+  block:
+    - name: Read signing public key
+      ansible.builtin.slurp:
+        src: "{{ signing_public_key }}"
+      register: signing_key_raw
+
+    - name: Write .edge-custom-config.yaml
+      ansible.builtin.copy:
+        dest: "{{ canvos_dir }}/.edge-custom-config.yaml"
+        mode: "0644"
+        content: |
+          content:
+           signing:
+            publicKey:
+             base64EncodedValue: "{{ signing_key_raw.content }}"
+             description: "Content signing public key ({{ signing_public_key | basename }})"
+      register: edge_config_file
+
+- name: Remove signing config when no key is configured
+  when: signing_public_key | length == 0
+  ansible.builtin.file:
+    path: "{{ canvos_dir }}/.edge-custom-config.yaml"
+    state: absent
+
+- name: Add host storage tooling (LVM + DRBD) to the Dockerfile
+  when: install_storage_tooling | bool
+  ansible.builtin.blockinfile:
+    path: "{{ canvos_dir }}/Dockerfile"
+    marker: "# {mark} ANSIBLE MANAGED - palette appliance storage stack"
+    block: |
+      # Piraeus/LINSTOR on DRBD needs LVM + DRBD user-space on the host, and
+      # the bundle's module-builder images compile DRBD against the running
+      # kernel, so matching kernel headers must be present too.
+      RUN if [ "${OS_DISTRIBUTION}" = "ubuntu" ]; then \
+            apt-get update && \
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+              lvm2 thin-provisioning-tools drbd-utils && \
+            apt-get clean && rm -rf /var/lib/apt/lists/*; \
+          fi
+      COPY scripts/install-kernel-headers.sh /tmp/install-kernel-headers.sh
+      RUN if [ "${OS_DISTRIBUTION}" = "ubuntu" ]; then \
+            chmod 755 /tmp/install-kernel-headers.sh && \
+            /tmp/install-kernel-headers.sh; \
+          fi; \
+          rm -f /tmp/install-kernel-headers.sh && \
+          rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
+  register: dockerfile_block
+
+- name: Look for an existing ISO
+  ansible.builtin.stat:
+    path: "{{ canvos_dir }}/build/{{ iso_name }}.iso"
+  register: existing_iso
+
+- name: Build the ISO (./earthly.sh +iso)
+  when: >-
+    force_rebuild | bool or not existing_iso.stat.exists
+    or arg_file.changed or user_data_file.changed
+    or (edge_config_file is defined and edge_config_file.changed)
+    or dockerfile_block.changed
+  ansible.builtin.command:
+    cmd: ./earthly.sh +iso
+    chdir: "{{ canvos_dir }}"
+  environment:
+    EARTHLY_BUILD_ARGS: ""
+  async: "{{ iso_build_timeout }}"
+  poll: 30
+  changed_when: true
+  register: iso_build
+
+- name: Confirm the ISO exists
+  ansible.builtin.stat:
+    path: "{{ canvos_dir }}/build/{{ iso_name }}.iso"
+    get_checksum: false
+  register: built_iso
+  failed_when: not built_iso.stat.exists
+
+- name: Verify the signing key landed in the ISO
+  when: signing_public_key | length > 0
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      bsdtar -xOf '{{ canvos_dir }}/build/{{ iso_name }}.iso' .edge_custom_config.yaml
+      | grep -c base64EncodedValue
+    executable: /bin/bash
+  changed_when: false
+  register: iso_key_check
+  failed_when: iso_key_check.rc != 0
+
+- name: Report ISO
+  ansible.builtin.debug:
+    msg: >-
+      ISO ready: {{ canvos_dir }}/build/{{ iso_name }}.iso
+      ({{ (built_iso.stat.size / 1024 / 1024) | round(1) }} MB),
+      signing key embedded: {{ 'yes' if signing_public_key else 'no' }}

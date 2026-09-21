@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# Licensed Spectro Cloud artifacts. These are downloaded per-deployment from
+# Artifact Studio and must never be committed: the content bundle alone is
+# ~10 GB, and none of it is ours to redistribute.
+# ---------------------------------------------------------------------------
+artifacts/*
+!artifacts/.gitkeep
+!artifacts/README.md
+
+# Anything that looks like an artifact, wherever it lands
+*.tar.zst
+*.sig.bin
+*.sig.hex
+*.iso
+*.iso.sha256
+*.raw
+*.raw.gz
+spc.tgz
+
+# Keys and credentials
+*.pem
+*.key
+*.crt
+!**/*.pub
+vault-password*
+*.vault
+
+# Build inputs the playbook renders into the CanvOS checkout
+CanvOS/.arg
+CanvOS/user-data
+CanvOS/.edge-custom-config.yaml
+CanvOS/build/
+CanvOS/content-*/
+
+# Ansible / local run state
+*.retry
+.ansible/
+host_vars/local.yml
+group_vars/local.yml
+inventory.local.ini
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp

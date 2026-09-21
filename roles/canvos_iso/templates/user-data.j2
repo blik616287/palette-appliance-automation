@@ -1,0 +1,42 @@
+#cloud-config
+# Palette management appliance user-data.
+#
+# Appliance install settings plus a seeded administrative account, so the
+# deployment completes without console interaction.
+install:
+  reboot: false
+  poweroff: true
+  grub_options:
+{% if fips_enabled | default(false) %}
+    extra_cmdline: "fips=1 selinux=0"
+{% else %}
+    # Set fips_enabled for a FIPS build; fips=1 on a non-FIPS kernel can
+    # fail to boot.
+    extra_cmdline: "selinux=0"
+{% endif %}
+  bind_mounts:
+    - /etc/lvm
+    - /var/lib/drbd
+    - /var/lib/linstor.d
+    - /var/lib/piraeus-datastore
+    - /var/lib/calico
+
+stylus:
+  debug: false
+  trace: false
+  installationMode: airgap
+  applianceType: palette
+  includeTui: true
+
+stages:
+  initramfs:
+    - name: "Seed appliance administrative account"
+      users:
+        {{ appliance_admin_user }}:
+          # SHA-512 crypt, computed with openssl (no passlib dependency).
+          # Deterministic salt keeps repeat runs byte-identical.
+          passwd: "{{ admin_password_hash }}"
+          groups:
+            - "{{ appliance_admin_group }}"
+          homedir: "/home/{{ appliance_admin_user }}"
+          shell: /bin/bash

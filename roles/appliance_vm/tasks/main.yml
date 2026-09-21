@@ -1,0 +1,149 @@
+---
+# Provision the appliance VM, run the unattended install, boot the result.
+# Uses virsh/virt-install directly so no libvirt Ansible collection is needed.
+
+- name: Reserve the cluster VIP in the libvirt network
+  when: reserve_vip | bool
+  ansible.builtin.shell:
+    cmd: >-
+      virsh -c {{ libvirt_uri }} net-dumpxml {{ vm_network }} | grep -q "ip='{{ cluster_vip }}'"
+      || virsh -c {{ libvirt_uri }} net-update {{ vm_network }} add ip-dhcp-host
+      "<host mac='{{ vip_reservation_mac }}' name='{{ cluster_name }}-vip' ip='{{ cluster_vip }}'/>"
+      --live --config
+    executable: /bin/bash
+  register: vip_reservation
+  changed_when: "'Updated network' in vip_reservation.stdout"
+
+- name: Remove any existing VM of this name
+  when: vm_recreate | bool
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      if virsh -c {{ libvirt_uri }} dominfo {{ vm_name }} >/dev/null 2>&1; then
+        virsh -c {{ libvirt_uri }} destroy {{ vm_name }} >/dev/null 2>&1 || true
+        virsh -c {{ libvirt_uri }} undefine {{ vm_name }} --nvram >/dev/null 2>&1 || true
+        echo removed
+      fi
+    executable: /bin/bash
+  register: vm_cleanup
+  changed_when: "'removed' in vm_cleanup.stdout"
+
+- name: Recreate the VM disks
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      for spec in "{{ vm_name }}-os.qcow2 {{ vm_os_disk_gb }}G" "{{ vm_name }}-data.qcow2 {{ vm_data_disk_gb }}G"; do
+        set -- $spec
+        virsh -c {{ libvirt_uri }} vol-delete --pool {{ libvirt_pool }} "$1" >/dev/null 2>&1 || true
+        virsh -c {{ libvirt_uri }} vol-create-as {{ libvirt_pool }} "$1" "$2" --format qcow2 >/dev/null
+      done
+      echo created
+    executable: /bin/bash
+  changed_when: true
+
+- name: Upload the ISO into the libvirt ISO pool
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      SZ=$(stat -c%s "{{ canvos_dir }}/build/{{ iso_name }}.iso")
+      virsh -c {{ libvirt_uri }} vol-delete --pool {{ libvirt_iso_pool }} {{ iso_name }}.iso >/dev/null 2>&1 || true
+      virsh -c {{ libvirt_uri }} vol-create-as {{ libvirt_iso_pool }} {{ iso_name }}.iso "$SZ" --format raw >/dev/null
+      virsh -c {{ libvirt_uri }} vol-upload --pool {{ libvirt_iso_pool }} {{ iso_name }}.iso "{{ canvos_dir }}/build/{{ iso_name }}.iso"
+      virsh -c {{ libvirt_uri }} vol-path --pool {{ libvirt_iso_pool }} {{ iso_name }}.iso
+    executable: /bin/bash
+  register: iso_volume
+  changed_when: true
+
+- name: Create the VM and start the unattended install
+  ansible.builtin.command:
+    argv:
+      - virt-install
+      - --connect={{ libvirt_uri }}
+      - --name={{ vm_name }}
+      - --memory={{ vm_memory_mb }}
+      - --vcpus={{ vm_vcpus }}
+      # "host" CPU is required; MongoDB in the management plane needs the
+      # host feature set.
+      - --cpu=host-passthrough
+      - --machine=q35
+      - --boot=loader={{ ovmf_code }},loader.readonly=yes,loader.type=pflash,loader.secure=no,nvram.template={{ ovmf_vars }}
+      - --controller=type=scsi,model=virtio-scsi
+      # virtio-scsi so disk naming matches the storage pool default.
+      - --disk=vol={{ libvirt_pool }}/{{ vm_name }}-os.qcow2,bus=scsi
+      - --disk=vol={{ libvirt_pool }}/{{ vm_name }}-data.qcow2,bus=scsi
+      - --cdrom={{ iso_volume.stdout_lines[-1] | trim }}
+      - --network=network={{ vm_network }},model=virtio
+      - --graphics=vnc,listen=127.0.0.1
+      # VGA renders the console for screenshots; virtio video does not.
+      - --video=vga
+      - --console=pty,target_type=serial
+      - --os-variant=ubuntu22.04
+      - --noautoconsole
+  changed_when: true
+
+- name: Wait for the installer to finish (it powers the VM off when done)
+  ansible.builtin.command:
+    cmd: virsh -c {{ libvirt_uri }} domstate {{ vm_name }}
+  register: install_state
+  until: install_state.stdout.strip() == 'shut off'
+  retries: "{{ (install_timeout / 20) | int }}"
+  delay: 20
+  changed_when: false
+
+- name: Eject the ISO and boot from disk
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      virsh -c {{ libvirt_uri }} change-media {{ vm_name }} sdc --eject --config >/dev/null 2>&1 || true
+      virt-xml --connect {{ libvirt_uri }} {{ vm_name }} --edit --boot hd >/dev/null
+      virsh -c {{ libvirt_uri }} start {{ vm_name }} >/dev/null
+      echo booted
+    executable: /bin/bash
+  changed_when: true
+
+- name: Get the appliance IP address
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      virsh -c {{ libvirt_uri }} domifaddr {{ vm_name }} | awk '/ipv4/{print $4}' | cut -d/ -f1 | head -1
+    executable: /bin/bash
+  register: appliance_ip_raw
+  until: appliance_ip_raw.stdout | trim | length > 0
+  retries: 60
+  delay: 10
+  changed_when: false
+
+- name: Store the appliance address
+  ansible.builtin.set_fact:
+    appliance_ip: "{{ appliance_ip_raw.stdout | trim }}"
+
+- name: Wait for Local UI to answer
+  ansible.builtin.uri:
+    url: "https://{{ appliance_ip }}:5080/"
+    validate_certs: false
+    status_code: [200]
+  register: localui
+  until: localui.status == 200
+  retries: "{{ (localui_timeout / 15) | int }}"
+  delay: 15
+
+- name: Confirm the seeded account authenticates
+  ansible.builtin.uri:
+    url: "https://{{ appliance_ip }}:5080/v1/users/default/login"
+    method: POST
+    validate_certs: false
+    body_format: json
+    body:
+      username: "{{ appliance_admin_user }}"
+      password: "{{ appliance_admin_password }}"
+    status_code: [200]
+  register: seeded_login
+  retries: 10
+  delay: 15
+  until: seeded_login.status == 200
+
+- name: Report appliance
+  ansible.builtin.debug:
+    msg: >-
+      Appliance up at https://{{ appliance_ip }}:5080 —
+      administrative login '{{ appliance_admin_user }}' is ready.

@@ -1,0 +1,67 @@
+---
+- name: Build a CanvOS appliance ISO and deploy self-hosted Palette
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  # 'always' so artifact discovery still runs when --tags selects one stage.
+  pre_tasks:
+    - name: Check the CanvOS submodule is checked out
+      ansible.builtin.stat:
+        path: "{{ canvos_dir }}/earthly.sh"
+      register: canvos_checkout
+      failed_when: not canvos_checkout.stat.exists
+      # Fails when the submodule was never initialised.
+      changed_when: false
+      tags: [always]
+
+    - name: Fail with instructions when the submodule is missing
+      when: not canvos_checkout.stat.exists
+      ansible.builtin.fail:
+        msg: "CanvOS submodule is empty — run: git submodule update --init"
+      tags: [always]
+
+    - name: Discover artifacts
+      ansible.builtin.set_fact:
+        content_bundle: >-
+          {{ content_bundle if content_bundle | length > 0
+             else (lookup('ansible.builtin.fileglob', artifacts_dir ~ '/*.tar.zst', wantlist=True) | sort | last | default('')) }}
+        content_bundle_signature: >-
+          {{ content_bundle_signature if content_bundle_signature | length > 0
+             else (lookup('ansible.builtin.fileglob', artifacts_dir ~ '/*.sig.bin', wantlist=True) | sort | last | default('')) }}
+        signing_public_key: >-
+          {{ signing_public_key if signing_public_key | length > 0
+             else (lookup('ansible.builtin.fileglob', artifacts_dir ~ '/*.pem', wantlist=True) | sort | last | default('')) }}
+      tags: [always]
+
+    - name: Require a content bundle
+      ansible.builtin.assert:
+        that: content_bundle | length > 0
+        fail_msg: >-
+          No content bundle found. Put the Artifact Studio .tar.zst in
+          {{ artifacts_dir }}/ (see artifacts/README.md) or pass
+          -e content_bundle=/path/to/bundle.tar.zst
+        success_msg: "Using content bundle: {{ content_bundle | basename }}"
+      tags: [always]
+
+    - name: Generate an appliance password when none was supplied
+      when: appliance_admin_password | length == 0
+      ansible.builtin.set_fact:
+        appliance_admin_password: "{{ lookup('ansible.builtin.password', '/dev/null length=20 chars=ascii_letters,digits') }}"
+      no_log: true
+      tags: [always]
+
+    - name: Report inputs
+      ansible.builtin.debug:
+        msg:
+          - "bundle:    {{ content_bundle | basename }}"
+          - "signature: {{ (content_bundle_signature | basename) if content_bundle_signature else '(none - uploading unsigned)' }}"
+          - "key:       {{ (signing_public_key | basename) if signing_public_key else '(none - no content verification)' }}"
+      tags: [always]
+  roles:
+    - role: canvos_iso
+      tags: [build, iso]
+    - role: appliance_vm
+      tags: [vm, install]
+    - role: palette_cluster
+      tags: [cluster, palette]

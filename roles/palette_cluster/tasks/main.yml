@@ -1,0 +1,221 @@
+---
+# Upload content + cluster definition, create the cluster, wait for Palette.
+
+- name: Create a working directory
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: palette
+  register: workdir
+
+- name: Generate a registry password when none was supplied
+  ansible.builtin.set_fact:
+    registry_password_effective: >-
+      {{ registry_password if registry_password | length > 0
+         else lookup('password', workdir.path ~ '/registry_password length=20 chars=ascii_letters,digits') }}
+
+- name: Verify the bundle signature against the signing key
+  when: signing_public_key | length > 0 and content_bundle_signature | length > 0
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - dgst
+      - -sha256
+      - -verify
+      - "{{ signing_public_key }}"
+      - -signature
+      - "{{ content_bundle_signature }}"
+      - "{{ content_bundle }}"
+  register: sig_verify
+  changed_when: false
+  failed_when: "'Verified OK' not in sig_verify.stdout"
+
+- name: Encode the signature for upload
+  when: content_bundle_signature | length > 0
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      xxd -p -c 1000 '{{ content_bundle_signature }}' | tr -d '\n' > '{{ workdir.path }}/content.sig.hex'
+    executable: /bin/bash
+  changed_when: true
+
+- name: Log in to Local UI
+  ansible.builtin.uri:
+    url: "https://{{ appliance_ip }}:5080/v1/users/default/login"
+    method: POST
+    validate_certs: false
+    body_format: json
+    body:
+      username: "{{ appliance_admin_user }}"
+      password: "{{ appliance_admin_password }}"
+    status_code: [200]
+  register: login
+
+- name: Save the session cookie for the curl uploads
+  ansible.builtin.copy:
+    dest: "{{ workdir.path }}/cookies"
+    mode: "0600"
+    # Netscape cookie jar; curl needs the header line and tab-separated fields.
+    content: "# Netscape HTTP Cookie File\n{{ appliance_ip }}\tFALSE\t/\tTRUE\t0\tAuthorization\t{{ login.cookies.Authorization }}\n"
+
+- name: Upload the content bundle
+  # curl rather than uri: streams ~10 GB as multipart.
+  ansible.builtin.command:
+    argv: "{{ ['curl', '-sk', '-b', workdir.path ~ '/cookies', '-X', 'POST',
+               '-F', 'uploadFile=@' ~ content_bundle]
+              + (['-F', 'signature=@' ~ workdir.path ~ '/content.sig.hex'] if content_bundle_signature | length > 0 else [])
+              + ['-o', workdir.path ~ '/upload.json', '-w', '%{http_code}',
+                 'https://' ~ appliance_ip ~ ':5080/v1/edge-mgmt/edgehosts/current/actions/upload-content'] }}"
+  register: content_upload
+  changed_when: true
+  failed_when: content_upload.stdout | trim not in ['200', '201']
+  async: 3600
+  poll: 30
+
+- name: Extract the cluster definition from the bundle
+  ansible.builtin.script:
+    cmd: "extract_spc.py '{{ content_bundle }}' '{{ workdir.path }}'"
+    executable: python3
+  register: spc_extract
+  changed_when: true
+
+- name: Upload the cluster definition
+  # Installed directly on the appliance when content signing is enabled.
+  when: signing_public_key | length == 0
+  ansible.builtin.command:
+    argv:
+      - curl
+      - -sk
+      - -b
+      - "{{ workdir.path }}/cookies"
+      - -X
+      - POST
+      - -F
+      - "uploadFile=@{{ workdir.path }}/spc.tgz"
+      - -o
+      - "{{ workdir.path }}/spc-upload.json"
+      - -w
+      - "%{http_code}"
+      - "https://{{ appliance_ip }}:5080/v1/edge-mgmt/edgehosts/current/actions/upload-clusterconfig"
+  register: spc_upload
+  changed_when: true
+  failed_when: spc_upload.stdout | trim not in ['200', '201']
+
+- name: Add the appliance as an Ansible host
+  ansible.builtin.add_host:
+    name: palette-appliance
+    ansible_host: "{{ appliance_ip }}"
+    ansible_user: "{{ appliance_admin_user }}"
+    ansible_password: "{{ appliance_admin_password }}"
+    ansible_become_password: "{{ appliance_admin_password }}"
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    ansible_python_interpreter: /usr/bin/python3
+  changed_when: false
+
+- name: Install the cluster definition on the appliance
+  delegate_to: palette-appliance
+  become: true
+  block:
+    - name: Ensure the spc directory exists
+      ansible.builtin.file:
+        path: /usr/local/spectrocloud/spc
+        state: directory
+        mode: "0755"
+
+    - name: Copy the cluster definition onto the appliance
+      ansible.builtin.copy:
+        src: "{{ workdir.path }}/spc.tgz"
+        dest: /usr/local/spectrocloud/spc/spc.tgz
+        mode: "0644"
+
+- name: Wait for the profiles to be readable
+  ansible.builtin.uri:
+    url: "https://{{ appliance_ip }}:5080/v1/edge-mgmt/cluster/applications"
+    validate_certs: false
+    headers:
+      Cookie: "Authorization={{ login.cookies.Authorization }}"
+    status_code: [200]
+  register: apps
+  until: apps.status == 200 and (apps.json.clusterProfileTemplates | default([]) | length > 0)
+  retries: 20
+  delay: 15
+
+- name: Get the edge host identity
+  ansible.builtin.uri:
+    url: "https://{{ appliance_ip }}:5080/v1/edge-mgmt/edgehosts/current"
+    validate_certs: false
+    headers:
+      Cookie: "Authorization={{ login.cookies.Authorization }}"
+    status_code: [200]
+  register: edgehost
+
+- name: Build the create-cluster payload
+  ansible.builtin.script:
+    cmd: >-
+      build_cluster_payload.py
+      --spc-dir '{{ workdir.path }}/spc-tree'
+      --spc-archive '{{ workdir.path }}/spc.tgz'
+      --out '{{ workdir.path }}/create-cluster.json'
+      --name '{{ cluster_name }}'
+      --vip '{{ cluster_vip }}'
+      --host-uid '{{ edgehost.json.metadata.id }}'
+      --host-ip '{{ appliance_ip }}'
+      --arch '{{ arch }}'
+      --set 'csi.placementCount={{ csi_placement_count }}'
+      --set 'mgmtplane.mongoReplicas={{ mongo_replicas }}'
+      --set 'csi.storagepoolDrive={{ storage_pool_drive }}'
+      --set 'registry.password={{ registry_password_effective }}'
+    executable: python3
+  register: payload_build
+  changed_when: true
+
+- name: Create the cluster
+  ansible.builtin.uri:
+    url: "https://{{ appliance_ip }}:5080/v1/edge-mgmt/cluster"
+    method: POST
+    validate_certs: false
+    headers:
+      Cookie: "Authorization={{ login.cookies.Authorization }}"
+    body_format: json
+    src: "{{ workdir.path }}/create-cluster.json"
+    remote_src: true
+    status_code: [200, 201, 202]
+  register: cluster_create
+
+- name: Wait for the cluster to reach Running
+  # Sessions are short-lived, so re-authenticate on each poll.
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      curl -sk -c '{{ workdir.path }}/poll.cookies' -X POST -H 'Content-Type: application/json' \
+        -d '{"username":"{{ appliance_admin_user }}","password":"{{ appliance_admin_password }}"}' \
+        --max-time 20 "https://{{ appliance_ip }}:5080/v1/users/default/login" -o /dev/null
+      curl -sk -b '{{ workdir.path }}/poll.cookies' --max-time 20 \
+        "https://{{ appliance_ip }}:5080/v1/edge-mgmt/cluster/details" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",{}).get("clusterState","?"))'
+    executable: /bin/bash
+  register: cluster_state
+  until: cluster_state.stdout | trim in ['Running', 'Error', 'Failed']
+  retries: "{{ (cluster_timeout / 30) | int }}"
+  delay: 30
+  changed_when: false
+  failed_when: cluster_state.stdout | trim in ['Error', 'Failed']
+
+- name: Wait for Palette to answer on the VIP
+  ansible.builtin.uri:
+    url: "https://{{ cluster_vip }}/system"
+    validate_certs: false
+    status_code: [200]
+  register: palette_vip
+  until: palette_vip.status == 200
+  retries: 40
+  delay: 30
+
+- name: Summary
+  ansible.builtin.debug:
+    msg:
+      - "Palette is up."
+      - "  Tenant console:  https://{{ cluster_vip }}"
+      - "  System console:  https://{{ cluster_vip }}/system"
+      - "  Local UI:        https://{{ appliance_ip }}:5080 ({{ appliance_admin_user }})"
+      - "  Registry admin:  admin / {{ registry_password_effective }}"
+      - "  Cluster:         {{ cluster_name }} ({{ cluster_state.stdout | trim }})"

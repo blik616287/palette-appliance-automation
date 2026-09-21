@@ -1,0 +1,21 @@
+PE_VERSION={{ pe_version }}
+CUSTOM_TAG={{ custom_tag }}
+IMAGE_REGISTRY={{ image_registry }}
+OS_DISTRIBUTION={{ os_distribution }}
+IMAGE_REPO={{ os_distribution }}
+OS_VERSION={{ os_version }}
+K8S_DISTRIBUTION={{ k8s_distribution }}
+K8S_VERSION={{ k8s_version }}
+ISO_NAME={{ iso_name }}
+ARCH={{ arch }}
+HTTPS_PROXY=
+HTTP_PROXY=
+UPDATE_KERNEL=false
+CIS_HARDENING=false
+FORCE_INTERACTIVE_INSTALL=false
+{% if signing_public_key %}
+EDGE_CUSTOM_CONFIG=.edge-custom-config.yaml
+{% endif %}
+# The cluster definition is installed after the appliance boots, not baked
+# into the ISO.
+CLUSTERCONFIG=
