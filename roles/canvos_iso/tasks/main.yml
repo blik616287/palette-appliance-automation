@@ -113,8 +113,8 @@
   ansible.builtin.command:
     cmd: ./earthly.sh +iso
     chdir: "{{ canvos_dir }}"
-  environment:
-    EARTHLY_BUILD_ARGS: ""
+  # Do not set EARTHLY_BUILD_ARGS here: the wrapper forwards it into the
+  # build container, and an empty value fails with "parse build args".
   async: "{{ iso_build_timeout }}"
   poll: 30
   changed_when: true

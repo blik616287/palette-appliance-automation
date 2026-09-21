@@ -1,7 +1,9 @@
 ---
 - name: Build a CanvOS appliance ISO and deploy self-hosted Palette
   hosts: localhost
-  connection: local
+  # No play-level 'connection: local' here: it would also apply to
+  # delegate_to tasks and silently run them on the controller. localhost is
+  # already local via inventory.ini.
   gather_facts: true
 
   # 'always' so artifact discovery still runs when --tags selects one stage.
@@ -48,6 +50,19 @@
       when: appliance_admin_password | length == 0
       ansible.builtin.set_fact:
         appliance_admin_password: "{{ lookup('ansible.builtin.password', '/dev/null length=20 chars=ascii_letters,digits') }}"
+      no_log: true
+      tags: [always]
+
+    - name: Record run credentials for troubleshooting
+      # Generated passwords otherwise exist only in memory and are printed
+      # only on success, which leaves a failed run's appliance unreachable.
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/.run-credentials.yml"
+        mode: "0600"
+        content: |
+          # Written by site.yml; gitignored. Contains appliance credentials.
+          appliance_admin_user: {{ appliance_admin_user }}
+          appliance_admin_password: {{ appliance_admin_password }}
       no_log: true
       tags: [always]
 

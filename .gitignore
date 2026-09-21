@@ -22,6 +22,7 @@ spc.tgz
 *.key
 *.crt
 !**/*.pub
+.run-credentials.yml
 vault-password*
 *.vault
 

@@ -127,6 +127,21 @@
         dest: /usr/local/spectrocloud/spc/spc.tgz
         mode: "0644"
 
+    - name: Confirm it landed on the appliance, not the controller
+      ansible.builtin.stat:
+        path: /usr/local/spectrocloud/spc/spc.tgz
+      register: spc_on_appliance
+
+    - name: Fail if the definition is missing or empty
+      ansible.builtin.assert:
+        that:
+          - spc_on_appliance.stat.exists
+          - spc_on_appliance.stat.size > 0
+        fail_msg: >-
+          Cluster definition is not present on the appliance. If the tasks
+          reported "localhost -> ...", the delegated connection fell back to
+          local; check that the play does not set connection: local.
+
 - name: Wait for the profiles to be readable
   ansible.builtin.uri:
     url: "https://{{ appliance_ip }}:5080/v1/edge-mgmt/cluster/applications"
