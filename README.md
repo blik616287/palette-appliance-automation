@@ -28,9 +28,10 @@ roles/
   canvos_iso/            renders build inputs, builds the ISO
   appliance_vm/          VIP reservation, disks, unattended install, first boot
   palette_cluster/       upload, cluster definition, create cluster, wait
+  palette_tenant/        create and activate the first tenant
 ```
 
-Run one stage: `--tags build`, `--tags vm`, `--tags cluster`.
+Run one stage: `--tags build`, `--tags vm`, `--tags cluster`, `--tags tenant`.
 
 ## Inputs
 
@@ -61,9 +62,15 @@ production deployments use three control-plane nodes.
 - **Single-node overrides.** The shipped profiles default to three replicas for
   storage placement and the database; `csi_placement_count` and `mongo_replicas`
   set those to 1 for a single-node deployment.
-- **Generated credentials.** The internal registry password is generated per
-  run unless you set `registry_password`, and is shown in the summary. Treat
-  the summary output as sensitive.
+- **Generated credentials.** The appliance, registry and tenant passwords are
+  generated per run unless set, and are written to `.run-credentials.yml`
+  (gitignored, mode 0600) as well as the summary. Treat both as sensitive.
+  Palette's own system console keeps its shipped default until you change it.
+- **A tenant is created for you.** Palette's system console admin is
+  system-scope only, so the tenant console has no usable account until a
+  tenant exists. The play creates one, activates it, and records the
+  credentials; set `create_tenant: false` to skip. Deleted organization names
+  stay reserved, so reuse of a previous `tenant_org_name` fails.
 - **Long-running.** A full run is roughly an hour: ISO build, install, a ~10 GB
   upload, then 20–30 minutes of cluster deployment. Timeouts are tunable in
   `group_vars/all.yml`.
