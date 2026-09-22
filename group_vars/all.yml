@@ -74,6 +74,20 @@ storage_pool_drive: /dev/sdb
 # Internal Zot registry admin password; generated per run when empty.
 registry_password: ""
 
+# --- First tenant -----------------------------------------------------------
+# Palette's system console admin is system-scope only; the tenant console has
+# no usable account until a tenant exists.
+create_tenant: true
+tenant_org_name: acme
+tenant_admin_first_name: Palette
+tenant_admin_last_name: Admin
+tenant_admin_email: admin@example.test
+# Generated per run when empty; recorded in .run-credentials.yml.
+tenant_admin_password: ""
+# Self-hosted Palette ships these defaults; change the password after install.
+palette_system_user: admin
+palette_system_password: admin
+
 # --- Timeouts (seconds) -----------------------------------------------------
 iso_build_timeout: 3600
 install_timeout: 3600

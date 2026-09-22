@@ -1,0 +1,142 @@
+---
+# Create the first tenant so Palette is usable on completion.
+#
+# Without this, the tenant console at https://<vip>/ has no account to log in
+# with: the system console's admin is system-scope only.
+
+- name: Log in to the system console
+  # Takes "username", not "emailId" (that returns 403).
+  ansible.builtin.uri:
+    url: "https://{{ cluster_vip }}/v1/auth/syslogin"
+    method: POST
+    validate_certs: false
+    body_format: json
+    body:
+      username: "{{ palette_system_user }}"
+      password: "{{ palette_system_password }}"
+    status_code: [200]
+  register: syslogin
+  retries: 10
+  delay: 15
+  until: syslogin.status == 200
+  no_log: true
+
+- name: List existing tenants
+  ansible.builtin.uri:
+    url: "https://{{ cluster_vip }}/v1/tenants"
+    validate_certs: false
+    headers:
+      Authorization: "{{ syslogin.json.Authorization }}"
+    status_code: [200]
+  register: tenants
+
+- name: Count tenants, ignoring soft-deleted ones
+  # Deleted tenants stay in the list annotated deleted="true".
+  ansible.builtin.set_fact:
+    # json['items'] with brackets: dotted access hits the dict's .items()
+    # method. The API returns null (not []) when there are none.
+    live_tenants: >-
+      {{ (tenants.json['items'] | default([], true))
+         | rejectattr('metadata.annotations.deleted', 'defined')
+         | list }}
+
+- name: Note when a tenant already exists
+  when: live_tenants | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      Tenant(s) already present ({{ live_tenants | map(attribute='spec.orgName') | join(', ') }});
+      skipping creation.
+
+- name: Create the tenant and activate its admin
+  when: live_tenants | length == 0
+  block:
+    - name: Create the tenant
+      ansible.builtin.uri:
+        url: "https://{{ cluster_vip }}/v1/tenants"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "{{ syslogin.json.Authorization }}"
+        body_format: json
+        body:
+          metadata: {}
+          spec:
+            orgName: "{{ tenant_org_name }}"
+            firstName: "{{ tenant_admin_first_name }}"
+            lastName: "{{ tenant_admin_last_name }}"
+            emailId: "{{ tenant_admin_email }}"
+            authType: password
+        status_code: [200, 201, 500]
+      register: tenant_create
+
+    - name: Explain a name collision with a deleted org
+      # Deleted orgs keep their name reserved; creating the same name 500s.
+      when: tenant_create.status == 500
+      ansible.builtin.fail:
+        msg: >-
+          {{ (tenant_create.json.message | default('tenant creation failed')) }}
+          {% if (tenant_create.json.code | default('')) == 'OrgInDeletedState' %}
+          Set tenant_org_name to a name that has never been used on this
+          instance; deleted organizations keep their name reserved.
+          {% endif %}
+
+    - name: Fetch the activation link
+      # Keyed by the TENANT uid, despite the /v1/users/ path.
+      ansible.builtin.uri:
+        url: "https://{{ cluster_vip }}/v1/users/{{ tenant_create.json.uid }}/activationlink"
+        validate_certs: false
+        headers:
+          Authorization: "{{ syslogin.json.Authorization }}"
+        status_code: [200]
+      register: activation
+      retries: 5
+      delay: 10
+      until: activation.status == 200 and (activation.json.activationLink | default('')) | length > 0
+
+    - name: Extract the activation token
+      ansible.builtin.set_fact:
+        activation_token: "{{ activation.json.activationLink | regex_search('/auth/password/([^/]+)/activate', '\\1') | first }}"
+
+    - name: Set the tenant admin password
+      # PATCH only; POST returns 405.
+      ansible.builtin.uri:
+        url: "https://{{ cluster_vip }}/v1/auth/password/{{ activation_token }}/activate"
+        method: PATCH
+        validate_certs: false
+        body_format: json
+        body:
+          password: "{{ tenant_admin_password }}"
+        status_code: [200, 204]
+      no_log: true
+
+    - name: Verify the tenant admin can log in
+      ansible.builtin.uri:
+        url: "https://{{ cluster_vip }}/v1/auth/authenticate"
+        method: POST
+        validate_certs: false
+        body_format: json
+        body:
+          emailId: "{{ tenant_admin_email }}"
+          password: "{{ tenant_admin_password }}"
+        status_code: [200]
+      register: tenant_login
+      no_log: true
+
+    - name: Record the tenant credentials
+      ansible.builtin.blockinfile:
+        path: "{{ playbook_dir }}/.run-credentials.yml"
+        create: true
+        mode: "0600"
+        marker: "# {mark} tenant"
+        block: |
+          tenant_org_name: {{ tenant_org_name }}
+          tenant_admin_email: {{ tenant_admin_email }}
+          tenant_admin_password: {{ tenant_admin_password }}
+      no_log: true
+
+    - name: Report the tenant
+      ansible.builtin.debug:
+        msg:
+          - "Tenant '{{ tenant_org_name }}' created and activated."
+          - "  Tenant console: https://{{ cluster_vip }}/  ({{ tenant_admin_email }})"
+          - "  System console: https://{{ cluster_vip }}/system  ({{ palette_system_user }} — change the default password)"
